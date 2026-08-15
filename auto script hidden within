@@ -1,0 +1,536 @@
+--// 3D Auto Pickup
+--// 15 Second Hold / Continuous Retry
+--// Mobile ON/OFF + 3D Detection + Target
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local Player = Players.LocalPlayer
+
+--==================================================
+-- SETTINGS
+--==================================================
+
+local Enabled = true
+
+local DetectionDistance = 10
+local HoldTime = 15
+local RetryDelay = 0.5
+
+--==================================================
+-- STATE
+--==================================================
+
+local CurrentPrompt = nil
+local AttemptRunning = false
+local StopWorker = false
+
+--==================================================
+-- 3D DETECTION RING
+--==================================================
+
+local Ring = Instance.new("Part")
+
+Ring.Name = "PickupDetectionRing"
+Ring.Shape = Enum.PartType.Cylinder
+
+Ring.Size = Vector3.new(
+    0.12,
+    DetectionDistance * 2,
+    DetectionDistance * 2
+)
+
+Ring.Anchored = true
+Ring.CanCollide = false
+Ring.CanTouch = false
+Ring.CanQuery = false
+
+Ring.Transparency = 0.65
+Ring.Material = Enum.Material.Neon
+Ring.Color = Color3.fromRGB(255, 0, 0)
+
+Ring.Parent = workspace
+
+--==================================================
+-- TARGET INDICATOR
+--==================================================
+
+local Target = Instance.new("Part")
+
+Target.Name = "PickupTarget"
+Target.Shape = Enum.PartType.Ball
+Target.Size = Vector3.new(0.35, 0.35, 0.35)
+
+Target.Anchored = true
+Target.CanCollide = false
+Target.CanTouch = false
+Target.CanQuery = false
+
+Target.Material = Enum.Material.Neon
+Target.Color = Color3.fromRGB(0, 255, 0)
+
+Target.Transparency = 1
+Target.Parent = workspace
+
+--==================================================
+-- UI
+--==================================================
+
+local Gui = Instance.new("ScreenGui")
+
+Gui.Name = "AutoPickupUI"
+Gui.ResetOnSpawn = false
+Gui.IgnoreGuiInset = false
+
+Gui.Parent = Player:WaitForChild("PlayerGui")
+
+local Button = Instance.new("TextButton")
+
+Button.Name = "Toggle"
+Button.Size = UDim2.fromOffset(90, 35)
+
+-- أعلى يمين
+Button.Position = UDim2.new(
+    1,
+    -105,
+    0,
+    15
+)
+
+Button.Text = "ON"
+Button.TextScaled = true
+
+Button.BackgroundColor3 =
+    Color3.fromRGB(35, 35, 35)
+
+Button.TextColor3 =
+    Color3.new(1, 1, 1)
+
+Button.BorderSizePixel = 0
+
+Button.Active = true
+Button.AutoButtonColor = true
+
+Button.Parent = Gui
+
+local Corner = Instance.new("UICorner")
+Corner.CornerRadius = UDim.new(0, 8)
+Corner.Parent = Button
+
+--==================================================
+-- CHARACTER
+--==================================================
+
+local function getRoot()
+
+    local Character = Player.Character
+
+    if not Character then
+        return nil
+    end
+
+    return Character:FindFirstChild(
+        "HumanoidRootPart"
+    )
+end
+
+--==================================================
+-- PROMPT POSITION
+--==================================================
+
+local function getPromptPosition(Prompt)
+
+    if not Prompt then
+        return nil
+    end
+
+    if not Prompt.Parent then
+        return nil
+    end
+
+    local Parent = Prompt.Parent
+
+    if Parent:IsA("BasePart") then
+
+        return Parent.Position
+
+    elseif Parent:IsA("Attachment") then
+
+        return Parent.WorldPosition
+
+    elseif Parent:IsA("Model") then
+
+        if Parent.PrimaryPart then
+            return Parent.PrimaryPart.Position
+        end
+
+        local Part =
+            Parent:FindFirstChildWhichIsA(
+                "BasePart"
+            )
+
+        if Part then
+            return Part.Position
+        end
+    end
+
+    return nil
+end
+
+--==================================================
+-- PROMPT CACHE
+--==================================================
+
+local Prompts = {}
+
+local function registerPrompt(Object)
+
+    if Object:IsA("ProximityPrompt") then
+        Prompts[Object] = true
+    end
+end
+
+local function unregisterPrompt(Object)
+
+    Prompts[Object] = nil
+
+    if CurrentPrompt == Object then
+        CurrentPrompt = nil
+    end
+end
+
+for _, Object in ipairs(
+    workspace:GetDescendants()
+) do
+
+    registerPrompt(Object)
+
+end
+
+workspace.DescendantAdded:Connect(
+    registerPrompt
+)
+
+workspace.DescendantRemoving:Connect(
+    unregisterPrompt
+)
+
+--==================================================
+-- FIND NEAREST PROMPT
+--==================================================
+
+local function findNearestPrompt()
+
+    local Root = getRoot()
+
+    if not Root then
+        return nil
+    end
+
+    local Nearest = nil
+    local BestDistance =
+        DetectionDistance
+
+    for Prompt in pairs(Prompts) do
+
+        if Prompt.Parent
+            and Prompt:IsDescendantOf(workspace)
+            and Prompt.Enabled then
+
+            local Position =
+                getPromptPosition(Prompt)
+
+            if Position then
+
+                local Distance =
+                    (
+                        Root.Position
+                        - Position
+                    ).Magnitude
+
+                if Distance <= BestDistance then
+
+                    BestDistance = Distance
+                    Nearest = Prompt
+
+                end
+            end
+        end
+    end
+
+    return Nearest
+end
+
+--==================================================
+-- UPDATE TARGET
+--==================================================
+
+local function updateTarget(Prompt)
+
+    if not Prompt then
+
+        Target.Transparency = 1
+        return
+
+    end
+
+    local Position =
+        getPromptPosition(Prompt)
+
+    if Position then
+
+        Target.Position = Position
+        Target.Transparency = 0
+
+    else
+
+        Target.Transparency = 1
+
+    end
+end
+
+--==================================================
+-- INTERACTION
+--==================================================
+
+local function doInteraction(Prompt)
+
+    if not Prompt then
+        return false
+    end
+
+    if not Prompt.Parent then
+        return false
+    end
+
+    if not Prompt:IsDescendantOf(workspace) then
+        return false
+    end
+
+    if not Prompt.Enabled then
+        return false
+    end
+
+    local Success = false
+
+    -- إذا كان بيئة الاختبار تدعم fireproximityprompt
+    if typeof(fireproximityprompt) == "function" then
+
+        local Result = pcall(function()
+
+            fireproximityprompt(
+                Prompt,
+                HoldTime
+            )
+
+        end)
+
+        Success = Result
+    end
+
+    return Success
+end
+
+--==================================================
+-- CONTINUOUS WORKER
+--==================================================
+
+local function startWorker(Prompt)
+
+    if AttemptRunning then
+        return
+    end
+
+    if not Prompt then
+        return
+    end
+
+    AttemptRunning = true
+    StopWorker = false
+
+    task.spawn(function()
+
+        while Enabled
+            and not StopWorker
+            and CurrentPrompt == Prompt do
+
+            --------------------------------------------
+            -- تحقق من الـPrompt
+            --------------------------------------------
+
+            if not Prompt.Parent
+                or not Prompt:IsDescendantOf(workspace)
+                or not Prompt.Enabled then
+
+                break
+            end
+
+            --------------------------------------------
+            -- تحقق من المسافة
+            --------------------------------------------
+
+            local Root = getRoot()
+            local Position =
+                getPromptPosition(Prompt)
+
+            if not Root or not Position then
+
+                task.wait(0.2)
+                continue
+
+            end
+
+            local Distance =
+                (
+                    Root.Position
+                    - Position
+                ).Magnitude
+
+            -- خارج النطاق
+            if Distance > DetectionDistance then
+
+                task.wait(0.2)
+                continue
+
+            end
+
+            --------------------------------------------
+            -- محاولة 15 ثانية
+            --------------------------------------------
+
+            doInteraction(Prompt)
+
+            --------------------------------------------
+            -- انتظار قبل المحاولة التالية
+            --------------------------------------------
+
+            task.wait(RetryDelay)
+
+        end
+
+        AttemptRunning = false
+
+    end)
+end
+
+--==================================================
+-- ON / OFF
+--==================================================
+
+Button.Activated:Connect(function()
+
+    Enabled = not Enabled
+
+    StopWorker = true
+
+    if Enabled then
+
+        Button.Text = "ON"
+
+        Button.BackgroundColor3 =
+            Color3.fromRGB(
+                35,
+                35,
+                35
+            )
+
+        StopWorker = false
+
+    else
+
+        Button.Text = "OFF"
+
+        Button.BackgroundColor3 =
+            Color3.fromRGB(
+                100,
+                40,
+                40
+            )
+
+        CurrentPrompt = nil
+
+        Target.Transparency = 1
+
+        Ring.Color =
+            Color3.fromRGB(
+                120,
+                120,
+                120
+            )
+
+    end
+end)
+
+--==================================================
+-- MAIN LOOP
+--==================================================
+
+RunService.Heartbeat:Connect(function()
+
+    local Root = getRoot()
+
+    if not Root then
+        return
+    end
+
+    -- تحريك دائرة الكشف
+    Ring.CFrame =
+        CFrame.new(
+            Root.Position
+        )
+        *
+        CFrame.Angles(
+            0,
+            0,
+            math.rad(90)
+        )
+
+    if not Enabled then
+        return
+    end
+
+    local Prompt =
+        findNearestPrompt()
+
+    if Prompt then
+
+        -- أخضر
+        Ring.Color =
+            Color3.fromRGB(
+                0,
+                255,
+                0
+            )
+
+        updateTarget(Prompt)
+
+        -- هدف جديد
+        if CurrentPrompt ~= Prompt then
+
+            CurrentPrompt = Prompt
+
+            AttemptRunning = false
+
+            startWorker(Prompt)
+
+        -- نفس الهدف لكن العامل توقف
+        elseif not AttemptRunning then
+
+            startWorker(Prompt)
+
+        end
+
+    else
+
+        -- أحمر
+        Ring.Color =
+            Color3.fromRGB(
+                255,
+                0,
+                0
+            )
+
+        Target.Transparency = 1
+
+    end
+end)
